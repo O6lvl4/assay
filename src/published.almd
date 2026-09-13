@@ -1,0 +1,209 @@
+// Published figures, each carrying the harness it was produced under and where it came
+// from. Verified against primary leaderboards on 2026-09-13.
+//
+// Prose loses the qualifiers. "Claude scores 72% on aider polyglot" is the sentence people
+// repeat, and it silently drops the attempt count, the edit format, the thinking budget and
+// the model date -- every one of which moves the number, and one of which (the date: this
+// is a 2025-05 model) makes the sentence useless for judging a 2026 system. Stored this way
+// the qualifiers cannot be dropped, because `score.incomparable` reads them.
+//
+// A figure belongs here only if it was read off the benchmark's own leaderboard. Numbers
+// reconstructed from vendor announcements are what produced this project's founding
+// mistake, and they are kept out: where a model has no published run, the absence is
+// recorded as an absence.
+
+import self.score
+
+// --- harness configurations, named once so a row cannot misspell one ---
+
+// Aider's polyglot protocol: two tries, with the test output from the first fed back.
+// Every Claude row on that leaderboard uses the diff edit format.
+let AIDER_2_DIFF = score.Harness { attempts: 2, edit_format: "diff", reasoning: "32k", tools: "" }
+let AIDER_2_DIFF_NOTHINK = score.Harness { attempts: 2, edit_format: "diff", reasoning: "", tools: "" }
+// One try, no feedback. Aider publishes this as "pass rate 1" on the same rows.
+let AIDER_1_DIFF = score.Harness { attempts: 1, edit_format: "diff", reasoning: "32k", tools: "" }
+// What vendor and aggregator leaderboards report for agentic runs: the scaffold is not
+// disclosed per row, so it is named as one opaque configuration rather than guessed at.
+let AGENT_UNDISCLOSED = score.Harness { attempts: 0, edit_format: "undisclosed", reasoning: "undisclosed", tools: "undisclosed" }
+
+let AIDER_SRC = "https://aider.chat/docs/leaderboards/"
+let BENCHLM_AGENTIC = "https://benchlm.ai/agentic"
+
+// --- aider polyglot, 225 exercises, 6 languages ---
+//
+// The pair of rows for one model is the single clearest number in this file: the same
+// model, the same day, 37.3 and 72.0, differing only in whether it was allowed a second
+// try after seeing the test output.
+let AIDER_POLYGLOT: List[score.Score] = [
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-opus-4-20250514",
+    value: 72.0, n: 225, harness: AIDER_2_DIFF, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-opus-4-20250514",
+    value: 37.3, n: 225, harness: AIDER_1_DIFF, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-opus-4-20250514-nothink",
+    value: 70.7, n: 225, harness: AIDER_2_DIFF_NOTHINK, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-3.7-sonnet-20250219",
+    value: 64.9, n: 225, harness: AIDER_2_DIFF, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-sonnet-4-20250514",
+    value: 61.3, n: 225, harness: AIDER_2_DIFF, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-3.5-sonnet-20241022",
+    value: 51.6, n: 225, harness: AIDER_2_DIFF, source: AIDER_SRC },
+  score.Score { benchmark: "aider-polyglot", variant: "225", model: "claude-3.5-haiku-20241022",
+    value: 28.0, n: 225, harness: AIDER_2_DIFF, source: AIDER_SRC },
+]
+
+// --- SWE-bench Pro: coding-specific, unsaturated, and the current target ---
+//
+// Verified sits at 96% for Opus 5 and has no open-weight rows, so it can measure nothing
+// here. Pro has both ends and a real spread.
+let SWE_PRO_SRC = "https://codingfleet.com/blog/swe-bench-pro-leaderboard-2026/"
+let SWE_BENCH_PRO: List[score.Score] = [
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "claude-fable-5.1",
+    value: 81.2, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "qwen3.8-max",
+    value: 67.7, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "gpt-5.6-sol",
+    value: 64.6, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "qwen3.8-flash-next",
+    value: 62.5, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "glm-5.2",
+    value: 62.1, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "qwen3.8-27b",
+    value: 61.7, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+  score.Score { benchmark: "swe-bench", variant: "pro", model: "claude-opus-4.6-max",
+    value: 53.4, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
+]
+
+// --- the agentic composite, and the components each model is actually listed for ---
+//
+// This is the asymmetry that produced the founding mistake. The composite is published for
+// both models; the components are not, and not for the same ones.
+let AGENTIC_COMPONENTS: List[score.Score] = [
+  score.Score { benchmark: "browsecomp", variant: "", model: "kimi-k3",
+    value: 91.2, n: 0, harness: AGENT_UNDISCLOSED, source: "https://benchlm.ai/benchmarks/browsecomp" },
+  score.Score { benchmark: "browsecomp", variant: "", model: "claude-opus-5",
+    value: 90.8, n: 0, harness: AGENT_UNDISCLOSED, source: "https://benchlm.ai/benchmarks/browsecomp" },
+  score.Score { benchmark: "osworld", variant: "verified", model: "qwen3.8-max",
+    value: 86.1, n: 0, harness: AGENT_UNDISCLOSED, source: "https://benchlm.ai/benchmarks/osworld-verified" },
+  score.Score { benchmark: "osworld", variant: "verified", model: "claude-fable-5",
+    value: 85.0, n: 0, harness: AGENT_UNDISCLOSED, source: "https://benchlm.ai/benchmarks/osworld-verified" },
+]
+
+// Absences, recorded as data. A missing row is the whole finding in two of these cases, and
+// a reader who cannot see the absence will reconstruct the gap from vendor figures instead
+// -- which is exactly the mistake.
+type Absence = { benchmark: String, variant: String, model: String, note: String, source: String }
+let ABSENCES: List[Absence] = [
+  Absence { benchmark: "osworld", variant: "verified", model: "kimi-k3",
+    note: "not listed; its agentic composite is therefore a mean over a different component set than Fable 5.1's",
+    source: "https://benchlm.ai/benchmarks/osworld-verified" },
+  Absence { benchmark: "browsecomp", variant: "", model: "claude-fable-5.1",
+    note: "not listed; the mirror image of Kimi K3's gap",
+    source: "https://benchlm.ai/benchmarks/browsecomp" },
+  Absence { benchmark: "swe-bench", variant: "pro", model: "glm-5.3",
+    note: "no published Pro run; z.ai reported DeepSWE v1.1 66.9, SWE-Marathon v1.1 42.5, Terminal-Bench 3.0 28.3 instead. This absence is the opportunity: a measured GLM-5.3 Pro number does not exist yet",
+    source: SWE_PRO_SRC },
+  Absence { benchmark: "swe-bench", variant: "verified", model: "glm-5.3",
+    note: "no open-weight rows published; Verified is also saturated at 96% for Opus 5, so it cannot separate systems",
+    source: "https://llm-stats.com/benchmarks/swe-bench-verified" },
+  Absence { benchmark: "aider-polyglot", variant: "225", model: "claude-opus-5",
+    note: "current Claude models are absent; the leaderboard's best Claude is opus-4 from 2025-05, so beating 72.0 is not beating current Claude",
+    source: AIDER_SRC },
+]
+
+// The published composites, kept separate from the components on purpose: these are the
+// numbers, and `score.coverage` over the components is what they are NOT.
+let AGENTIC_COMPOSITE: List[score.Score] = [
+  score.Score { benchmark: "benchlm-agentic", variant: "composite", model: "claude-fable-5.1",
+    value: 80.2, n: 0, harness: AGENT_UNDISCLOSED, source: BENCHLM_AGENTIC },
+  score.Score { benchmark: "benchlm-agentic", variant: "composite", model: "claude-opus-5",
+    value: 78.1, n: 0, harness: AGENT_UNDISCLOSED, source: BENCHLM_AGENTIC },
+  score.Score { benchmark: "benchlm-agentic", variant: "composite", model: "kimi-k3",
+    value: 71.9, n: 0, harness: AGENT_UNDISCLOSED, source: BENCHLM_AGENTIC },
+  score.Score { benchmark: "benchlm-agentic", variant: "composite", model: "glm-5.3",
+    value: 68.4, n: 0, harness: AGENT_UNDISCLOSED, source: BENCHLM_AGENTIC },
+  score.Score { benchmark: "benchlm-agentic", variant: "composite", model: "glm-5.3-flash",
+    value: 60.1, n: 0, harness: AGENT_UNDISCLOSED, source: BENCHLM_AGENTIC },
+]
+
+fn all() -> List[score.Score] =
+  AIDER_POLYGLOT + SWE_BENCH_PRO + AGENTIC_COMPONENTS + AGENTIC_COMPOSITE
+
+fn find(bm: String, variant: String, model: String) -> score.Score? =
+  list.find(all(), (s) => s.benchmark == bm and s.variant == variant and s.model == model)
+
+fn absence(bm: String, variant: String, model: String) -> Absence? =
+  list.find(ABSENCES, (a) => a.benchmark == bm and a.variant == variant and a.model == model)
+
+test "the attempt budget is worth more than a model generation, and the data says so" {
+  let two = find("aider-polyglot", "225", "claude-opus-4-20250514")
+  // Same model id, one attempt: stored as a separate row because the harness differs.
+  let one = list.find(AIDER_POLYGLOT, (s) => s.model == "claude-opus-4-20250514" and s.harness.attempts == 1)
+  match (two, one) {
+    (some(t), some(o)) => {
+      // Refused unless the caller declares attempts as the axis under test.
+      assert(not score.comparable(t, o, ""))
+      assert(score.comparable(t, o, "attempts"))
+      match score.delta(t, o, "attempts") { ok(d) => assert(score.near(d, 34.7, 0.01)), err(_) => assert(false) }
+      // For scale: the whole Claude 3.5-Sonnet-to-Opus-4 span on this benchmark is smaller.
+      match (find("aider-polyglot", "225", "claude-3.5-sonnet-20241022"), two) {
+        (some(old), some(new_)) => assert(new_.value - old.value < 34.7),
+        _ => assert(false),
+      }
+    },
+    _ => assert(false),
+  }
+}
+
+test "an absence is queryable, so a gap cannot be reconstructed by accident" {
+  match absence("swe-bench", "pro", "glm-5.3") {
+    some(a) => assert(string.contains(a.note, "does not exist yet")),
+    none => assert(false),
+  }
+  // And the two that made the composite subtraction invalid.
+  assert(option.is_some(absence("osworld", "verified", "kimi-k3")))
+  assert(option.is_some(absence("browsecomp", "", "claude-fable-5.1")))
+  // Beating aider's best Claude is not beating current Claude, and that is recorded.
+  match absence("aider-polyglot", "225", "claude-opus-5") {
+    some(a) => assert(string.contains(a.note, "2025-05")),
+    none => assert(false),
+  }
+}
+
+test "the published composite is not the coverage, and the coverage refuses the subtraction" {
+  let defn = score.Definition {
+    name: "benchlm-agentic",
+    components: [
+      score.Component { benchmark: "terminal-bench", variant: "2.0", weight: 30.0 },
+      score.Component { benchmark: "browsecomp", variant: "", weight: 25.0 },
+      score.Component { benchmark: "osworld", variant: "verified", weight: 25.0 },
+      score.Component { benchmark: "osworld", variant: "2.0", weight: 10.0 },
+    ],
+    source: BENCHLM_AGENTIC,
+  }
+  let k = score.coverage("kimi-k3", defn, all())
+  let f = score.coverage("claude-fable-5", defn, all())
+  // Neither is anywhere near complete, and they do not overlap.
+  assert(k.covered < 0.3)
+  assert(f.covered < 0.3)
+  assert(string.contains(score.coverage_incomparable(k, f), "different components"))
+  assert(result.is_err(score.composite_delta(k, f)))
+
+  // The published composites exist and can be read; they simply are not this.
+  match (find("benchlm-agentic", "composite", "kimi-k3"), find("benchlm-agentic", "composite", "claude-fable-5.1")) {
+    (some(a), some(b)) => assert(score.near(b.value - a.value, 8.3, 0.01)),
+    _ => assert(false),
+  }
+}
+
+test "SWE-bench Pro separates systems where Verified cannot" {
+  match (find("swe-bench", "pro", "claude-fable-5.1"), find("swe-bench", "pro", "glm-5.2")) {
+    (some(top), some(open)) => {
+      // A real, published, same-benchmark spread -- unlike the 13 points that were invented.
+      assert(score.near(top.value - open.value, 19.1, 0.05))
+      assert(score.comparable(top, open, ""))
+    },
+    _ => assert(false),
+  }
+  // Verified has no open-weight row to compare against at all.
+  assert(option.is_some(absence("swe-bench", "verified", "glm-5.3")))
+}
