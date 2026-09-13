@@ -49,42 +49,51 @@ Usage
 `GOLEMIDE_BINARY` points at the host build. Cloudflare credentials are read from the host
 environment; they never enter the container, because golemide never runs there.
 
-What this adapter found, and why it cannot be fixed here
---------------------------------------------------------
-The bridge works. Two trials completed with no exceptions, and both scored zero for one
-reason, logged verbatim:
+The success signal, which this benchmark refuses to provide
+-----------------------------------------------------------
+The bridge worked on the first attempt and both trials still scored zero, for one reason
+logged verbatim:
 
     no verify command found under /app; leaving this trial unattempted
 
 Not a discovery bug. The task container holds `gates.txt` and `sim.c` and **no tests at
 all** -- Harbor injects and runs them after the agent exits, which is how the oracle agent
-scores 1.0. Terminal-Bench withholds the success signal on purpose.
+scores 1.0. Terminal-Bench withholds the success signal on purpose, because deciding when
+the job is done is part of what it measures. golemide's entire interface is `--verify CMD`,
+"the command whose exit status defines success", so without one it attempts nothing.
 
-golemide's entire interface is `--verify CMD`, "the command whose exit status defines
-success". On this benchmark no such command exists for the agent to have. So golemide
-cannot compete here as designed, and no amount of adapter work changes that: the benchmark
-measures the one thing golemide delegates to its caller -- deciding when the job is done,
-without being told.
-
-That is the same gap `emet`'s design document names as its entrance gate: "the entrance
+That is exactly the gap `emet`'s design document names as its entrance gate: "the entrance
 asks whether a request can be turned into acceptance criteria". It was written down as the
 missing piece before this run measured it.
 
-So the honest boundary: a test-driven loop can be made cheaper, more careful and better
-targeted -- all measured, all real -- and it still cannot enter a benchmark that refuses to
-tell it what passing means. Closing that needs a component that manufactures acceptance
-criteria from prose and abstains when it cannot, which is a different program from this one.
+So the verify command is sought in three tiers, weakest claim last:
+
+1. `_discover_verify` -- the task's own test entrypoint, if it ships one;
+2. `_derive_verify` -- build-and-run on the files present. Measured to fire on neither task
+   tried: Terminal-Bench tasks do not share a shape ("write a MIPS interpreter that runs
+   Doom" has no mechanical build check), so this is the floor and is left unextended;
+3. `_stated_verify` -- ask a model to state the criteria, then **run them on the untouched
+   task and keep them only if they fail**. A criterion that passes before any edit cannot
+   guide an edit. That check is a measurement, not a judgement of the model's answer, which
+   is the distinction `emet` is built on.
+
+Nothing in tier 3 can inflate a score: Harbor grades the container independently afterwards,
+so stated criteria can only guide or waste attempts, never award them. Abstaining is
+therefore cheaper than guessing, and all three tiers abstain rather than substitute a
+command that would trivially pass.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shlex
 import shutil
 import tempfile
+import urllib.request
 from pathlib import Path
 from typing import override
 
@@ -213,8 +222,9 @@ class GolemideAgent(BaseAgent):
         applicable. Deriving a signal per task shape is a losing game on a benchmark whose
         whole point is that the tasks do not share a shape.
 
-        So this function stays as the floor for simple tasks and is left deliberately
-        unextended. The gap it exposes is not a missing heuristic.
+        So this function stays as the floor for simple tasks. What extends past it is
+        `_stated_verify`, which asks a model to state the criteria and then checks that the
+        criteria discriminate -- not another file-shape heuristic.
         """
         probe = await environment.exec(
             f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=20
@@ -245,6 +255,142 @@ class GolemideAgent(BaseAgent):
             return f"sh -n {shlex.quote(sh_file)}"
         return None
 
+    async def _stated_verify(
+        self, instruction: str, environment: BaseEnvironment, root: str
+    ) -> str | None:
+        """Acceptance criteria stated from the instruction, kept only if they discriminate.
+
+        This is `emet`'s entrance gate at its smallest: turn a request into a check, and
+        abstain when you cannot. Terminal-Bench withholds its tests, so without this a
+        test-driven loop has nothing to iterate against and attempts nothing at all.
+
+        The gate is the second step, not the first. A model asked for a check will happily
+        produce one that passes on anything, and a criterion that passes before any edit
+        cannot guide an edit. So the proposed command is RUN ON THE UNTOUCHED CONTAINER and
+        kept only if it fails there. That is a measurement, not a judgement of the model's
+        answer -- the distinction `emet` is built on.
+
+        Nothing here can inflate a score: Harbor grades the container independently
+        afterwards. A bad criterion can only waste attempts, which is why it is cheaper to
+        abstain than to guess.
+        """
+        account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        token = os.environ.get("CLOUDFLARE_API_TOKEN")
+        if not account or not token:
+            # Every abstention says why. A silent one is indistinguishable from a principled
+            # one, and this branch was silent while a response-shape bug upstream was the
+            # real cause -- which cost a run to find.
+            self.logger.warning(
+                "no Cloudflare credentials on the host, so criteria cannot be stated; "
+                "abstaining"
+            )
+            return None
+
+        listing = (
+            await environment.exec(f"ls -RF {shlex.quote(root)} 2>/dev/null | head -60")
+        ).stdout or ""
+
+        prompt = (
+            "You are given a task and the files present. Reply with ONE shell command, and "
+            "nothing else, that exits 0 only when the task is COMPLETE and non-zero while "
+            "it is incomplete. It runs in the project directory. It must actually test the "
+            "work: a command that always succeeds is useless. No explanation, no markdown, "
+            "no backticks.\n\n"
+            f"TASK:\n{instruction[:3000]}\n\nFILES:\n{listing[:2000]}\n"
+        )
+        # `max_tokens` covers the reasoning as well as the answer, and glm-5.3-flash spends
+        # it on `reasoning_content` first. At 300 tokens it returned finish_reason "length"
+        # with an EMPTY content field; at 4096 it did the same. That is the worst kind of
+        # failure here, because an empty answer is indistinguishable from a principled
+        # abstention -- the adapter reported "could not state criteria" when the real cause
+        # was its own token budget.
+        #
+        # `reasoning_effort: low` is the fix, measured against the alternative: at low effort
+        # 4096 tokens returns a usable command with finish_reason "stop", while raising the
+        # budget to 16384 without it timed out instead. Stating a check does not need deep
+        # reasoning; the check's quality is decided by the discriminate test below, not by
+        # how long the model thought about it.
+        body = json.dumps(
+            {
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 8192,
+                "reasoning_effort": "low",
+            }
+        ).encode()
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/{account}"
+            "/ai/run/@cf/zai-org/glm-5.3-flash"
+        )
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = json.loads(resp.read().decode())
+        except Exception as exc:  # network, auth, rate limit -- all mean "no criteria"
+            self.logger.warning("could not state criteria: %s", exc)
+            return None
+
+        # Workers AI answers in either shape depending on the model: a bare `response`, or
+        # OpenAI-style `choices[].message.content`. glm-5.3-flash uses the latter, and
+        # reading only the former was a silent empty string.
+        result = payload.get("result") or {}
+        text = result.get("response") or ""
+        if not text:
+            choices = result.get("choices") or []
+            if choices:
+                text = ((choices[0] or {}).get("message") or {}).get("content") or ""
+        if not text:
+            self.logger.warning(
+                "the model returned no content for the criteria (finish_reason=%s); abstaining",
+                ((result.get("choices") or [{}])[0] or {}).get("finish_reason"),
+            )
+            return None
+        candidate = ""
+        for line in text.strip().splitlines():
+            line = line.strip().strip("`")
+            if line and not line.startswith("#"):
+                candidate = line
+                break
+        if not candidate:
+            return None
+
+        # Refuse the shapes that cannot discriminate by construction.
+        if re.fullmatch(r"(true|:|exit\s+0|/bin/true)\s*;?", candidate):
+            self.logger.warning("stated criteria always pass; abstaining: %r", candidate)
+            return None
+
+        # The measurement: criteria that pass before any edit are worthless.
+        probe = await environment.exec(candidate, cwd=root, timeout_sec=180)
+        if probe.return_code == 0:
+            self.logger.warning(
+                "stated criteria already pass on the untouched task, so they cannot guide "
+                "an edit; abstaining: %r", candidate
+            )
+            return None
+
+        # What the discriminate test cannot catch, measured rather than assumed. Asked for a
+        # check on an open-ended task ("write a MIPS interpreter that runs Doom"), the model
+        # returns the SOLUTION disguised as a check -- a `cat > mips.c <<EOF ...` heredoc
+        # that writes an implementation and then compiles it. Failing-before-the-edit rejects
+        # criteria that always pass; it cannot reject criteria that contain their own answer.
+        #
+        # So this tier gets the loop moving and cannot be trusted to aim it. A gate that could
+        # is `emet`'s: sample k interpretations of the request and abstain when they disagree,
+        # which measures the request's determinacy instead of trusting one answer about it. A
+        # single call has no way to tell a criterion from a solution.
+        if len(candidate) > 400 or "<<" in candidate or "cat >" in candidate:
+            self.logger.warning(
+                "stated criteria look like an implementation rather than a check "
+                "(%d chars); abstaining: %.120s", len(candidate), candidate
+            )
+            return None
+
+        self.logger.info("stated criteria discriminate (exit %s): %s", probe.return_code, candidate)
+        return candidate
+
     @override
     async def run(
         self,
@@ -262,20 +408,22 @@ class GolemideAgent(BaseAgent):
             root = ((await environment.exec("pwd")).stdout or "/").strip() or "/"
 
         verify = await self._discover_verify(environment, root)
-        derived = False
+        source = "the task's own"
         if verify is None:
             verify = await self._derive_verify(environment, root)
-            derived = verify is not None
+            source = "derived from the task's files"
+        if verify is None:
+            # Last resort, and the only one that reads the instruction: state the criteria,
+            # then keep them only if they fail on the untouched task.
+            verify = await self._stated_verify(instruction, environment, root)
+            source = "stated from the instruction"
         if verify is None:
             self.logger.warning(
                 "no verify command found or derivable under %s; leaving this trial "
                 "unattempted rather than looping against nothing", root
             )
             return
-        self.logger.info(
-            "verify (%s): %s", "derived from the task's files" if derived else "task's own",
-            verify,
-        )
+        self.logger.info("verify (%s): %s", source, verify)
 
         work = Path(tempfile.mkdtemp(prefix="golemide-harbor-"))
         try:
