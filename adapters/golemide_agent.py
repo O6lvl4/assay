@@ -227,11 +227,27 @@ class GolemideAgent(BaseAgent):
             return None
 
     async def _discover_verify(self, environment: BaseEnvironment, root: str) -> str | None:
+        """Which of the marker files exist, in one round trip rather than eight.
+
+        This used to be a loop: one `exec` per candidate, each a fresh `docker compose exec`
+        with that command's whole startup cost, and a 20-second ceiling on each. Under four
+        concurrent trials that ceiling is not generous, and it was the crash site -- six of ten
+        trials in one pilot died here with `Command timed out after 20 seconds`, including a
+        task that had scored a reward of 1.0 in the run before. The probe is `test -e` eight
+        times; the expense was never the test, it was the eight crossings.
+        """
+        markers = [m for m, _ in _VERIFY_CANDIDATES]
+        listing = " ".join(shlex.quote(f"{root}/{m}") for m in markers)
+        probe = await self._probe(
+            environment,
+            f'for p in {listing}; do [ -e "$p" ] && echo "$p"; done; exit 0',
+            timeout_sec=90,
+        )
+        if probe is None:
+            return None
+        present = {line.strip() for line in (probe.stdout or "").splitlines() if line.strip()}
         for marker, command in _VERIFY_CANDIDATES:
-            probe = await self._probe(
-                environment, f"test -e {shlex.quote(f'{root}/{marker}')}", timeout_sec=20
-            )
-            if probe is not None and probe.return_code == 0:
+            if f"{root}/{marker}" in present:
                 return command
         return None
 
@@ -269,8 +285,10 @@ class GolemideAgent(BaseAgent):
         `_stated_verify`, which asks a model to state the criteria and then checks that the
         criteria discriminate -- not another file-shape heuristic.
         """
+        # 90s, not 20s: the command is `ls`, but the crossing is a `docker compose exec`, and
+        # four concurrent trials made 20s too tight -- this line ended a trial outright.
         probe = await self._probe(
-            environment, f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=20
+            environment, f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=90
         )
         if probe is None:
             return None
