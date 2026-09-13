@@ -1,0 +1,270 @@
+// A benchmark score, and the two rules that make one comparable to another.
+//
+// Running a benchmark is the easy half and every benchmark ships its own runner. The hard
+// half is saying what a number means next to another number, and that is where this
+// exists. Both rules below come from a specific mistake, made in one session, in the
+// direction of flattering the thing being measured.
+//
+// ## Rule 1: a score is a property of a model AND a harness, never of a model
+//
+// The Terminal-Bench maintainers report the same model swinging 30 to 50 points depending
+// on the scaffold around it. Aider's leaderboard publishes the edit format and the attempt
+// count on every row because they move the result more than most model changes do:
+//
+//     Claude Opus 4 (32k thinking), aider polyglot, diff format
+//       1 attempt            37.3%
+//       2 attempts, with test feedback after the first      72.0%
+//
+// Nearly double, same model, same benchmark, same day. So `Score` carries its `Harness`,
+// and `comparable` refuses any pair whose harness differs in a dimension the caller did
+// not declare as the one under test. The mistake this prevents: reading a harness
+// difference as a capability difference.
+//
+// ## Rule 2: a composite over missing components is not a score
+//
+// BenchLM's agentic composite is "normalized by available weights", and the components are
+// missing differently per model:
+//
+//     component           Kimi K3      Claude Fable 5.1
+//     BrowseComp          91.2         not listed
+//     OSWorld-Verified    not listed   (Fable 5: 85.0)
+//
+// So its published 71.9 and 80.2 are averages over different component sets. Subtracting
+// them, or subtracting a reconstruction from vendor figures, produces a number that
+// describes nothing. That subtraction was done, and it invented a 13-point "harness loss"
+// that sent a day of work after a gap that did not exist.
+//
+// `composite` therefore reports the weight it actually covered and the components it could
+// not find, and `composite_comparable` refuses two models whose covered sets differ.
+
+// What surrounded the model. Every field here has been observed to move a score.
+type Harness = {
+  // Tries at one task, with test output fed back between them. Aider uses 2; golemide
+  // defaults to 6. Not comparable across values.
+  attempts: Int,
+  // "whole" (emit the complete file), "diff" (a patch), "replace" (search/replace blocks).
+  // Every Claude row on aider's polyglot leaderboard is "diff".
+  edit_format: String,
+  // Reasoning effort or thinking budget, as the vendor spells it: "low", "32k", "".
+  reasoning: String,
+  // Free text for what the agent could call. Compared as an opaque string: different text
+  // means not comparable, because nobody can tell whether two tool sets are equivalent.
+  tools: String,
+}
+
+type Score = {
+  // The benchmark and the exact variant. "swe-bench" alone is not a benchmark:
+  // Verified sits at 96% while Pro sits at 81.2% for the same top model.
+  benchmark: String,
+  variant: String,
+  model: String,
+  // Percent correct, 0..100.
+  value: Float,
+  // Tasks actually attempted. A subset score is not a full-set score, and saying so is
+  // this field's whole job.
+  n: Int,
+  harness: Harness,
+  // Where the number came from: a URL, or "measured: <run id>". A score with no source
+  // cannot be checked, and one that cannot be checked does not belong in a comparison.
+  source: String,
+}
+
+// Why a pair cannot be compared, or "" when it can.
+//
+// `varying` names the ONE harness dimension the caller is deliberately changing; every
+// other dimension must match. Passing "" means "nothing may differ".
+fn incomparable(a: Score, b: Score, varying: String) -> String = {
+  if a.benchmark != b.benchmark then "different benchmarks: " + a.benchmark + " vs " + b.benchmark
+  else if a.variant != b.variant then "same benchmark, different variant: " + a.variant + " vs " + b.variant
+    + " — variants are not versions of one number (SWE-bench Verified 96% vs Pro 81.2% for the same model)"
+  else if a.n != b.n then "different task counts: " + int.to_string(a.n) + " vs " + int.to_string(b.n)
+    + " — a subset score is not a full-set score"
+  else if varying != "attempts" and a.harness.attempts != b.harness.attempts then
+    "different attempt budgets: " + int.to_string(a.harness.attempts) + " vs " + int.to_string(b.harness.attempts)
+    + " — Claude Opus 4 scored 37.3% at 1 attempt and 72.0% at 2 on the same benchmark"
+  else if varying != "edit_format" and a.harness.edit_format != b.harness.edit_format then
+    "different edit formats: " + a.harness.edit_format + " vs " + b.harness.edit_format
+  else if varying != "reasoning" and a.harness.reasoning != b.harness.reasoning then
+    "different reasoning budgets: \"" + a.harness.reasoning + "\" vs \"" + b.harness.reasoning + "\""
+  else if varying != "tools" and a.harness.tools != b.harness.tools then
+    "different tool sets: \"" + a.harness.tools + "\" vs \"" + b.harness.tools + "\""
+  else if a.source == "" or b.source == "" then "a score with no source cannot be checked"
+  else ""
+}
+
+fn comparable(a: Score, b: Score, varying: String) -> Bool = incomparable(a, b, varying) == ""
+
+// The difference, or the reason there isn't one to report.
+fn delta(a: Score, b: Score, varying: String) -> Result[Float, String] = {
+  let why = incomparable(a, b, varying)
+  if why != "" then err(why) else ok(a.value - b.value)
+}
+
+// --- composites ---
+
+type Component = { benchmark: String, variant: String, weight: Float }
+type Definition = { name: String, components: List[Component], source: String }
+
+// A composite as actually computable for one model: what it covers, and what it does not.
+type Coverage = {
+  model: String,
+  // Weighted mean over the components that were found, renormalised to them.
+  value: Float,
+  // Fraction of the definition's total weight that was found, 0..1.
+  covered: Float,
+  found: List[String],
+  missing: List[String],
+}
+
+local fn key(benchmark: String, variant: String) -> String = benchmark + "/" + variant
+
+fn coverage(model: String, def: Definition, scores: List[Score]) -> Coverage = {
+  var total = 0.0
+  var got = 0.0
+  var acc = 0.0
+  var found: List[String] = []
+  var missing: List[String] = []
+  for c in def.components {
+    total = total + c.weight
+    let hit = list.find(scores, (s) => s.model == model and s.benchmark == c.benchmark and s.variant == c.variant)
+    match hit {
+      some(s) => { got = got + c.weight; acc = acc + c.weight * s.value; list.push(found, key(c.benchmark, c.variant)) },
+      none => list.push(missing, key(c.benchmark, c.variant)),
+    }
+  }
+  Coverage {
+    model: model,
+    value: if got == 0.0 then 0.0 else acc / got,
+    covered: if total == 0.0 then 0.0 else got / total,
+    found: found,
+    missing: missing,
+  }
+}
+
+// Two coverages are comparable only over an identical found-set. This is the rule whose
+// absence produced the 13-point artifact: the two composites being subtracted were means
+// over different components, and nothing in either number said so.
+fn coverage_incomparable(a: Coverage, b: Coverage) -> String = {
+  let only_a = list.filter(a.found, (f) => not list.contains(b.found, f))
+  let only_b = list.filter(b.found, (f) => not list.contains(a.found, f))
+  if list.is_empty(only_a) and list.is_empty(only_b) then ""
+  else "these composites average over different components, so their difference describes nothing"
+    + (if list.is_empty(only_a) then "" else "; only " + a.model + " has " + string.join(only_a, ", "))
+    + (if list.is_empty(only_b) then "" else "; only " + b.model + " has " + string.join(only_b, ", "))
+}
+
+fn composite_delta(a: Coverage, b: Coverage) -> Result[Float, String] = {
+  let why = coverage_incomparable(a, b)
+  if why != "" then err(why) else ok(a.value - b.value)
+}
+
+// Percentages do not survive binary floating point: 88.3 - 89.0 is -0.7000000000000028,
+// and a tool whose job is reporting measurements should not print that or compare against
+// it exactly. `near` is for assertions; `tenths` is for anything a person reads.
+fn near(a: Float, b: Float, eps: Float) -> Bool = {
+  let d = a - b
+  (if d < 0.0 then 0.0 - d else d) <= eps
+}
+
+fn tenths(x: Float) -> Float = float.round(x * 10.0) / 10.0
+
+// --- tests ---
+
+let AIDER = Harness { attempts: 2, edit_format: "diff", reasoning: "32k", tools: "" }
+
+local fn score(bm: String, v: String, m: String, val: Float, n: Int, h: Harness) -> Score =
+  Score { benchmark: bm, variant: v, model: m, value: val, n: n, harness: h, source: "https://aider.chat/docs/leaderboards/" }
+
+test "a harness difference is never reported as a capability difference" {
+  let two = score("aider-polyglot", "225", "opus-4", 72.0, 225, AIDER)
+  let one = score("aider-polyglot", "225", "opus-4", 37.3, 225, Harness { ...AIDER, attempts: 1 })
+
+  // The same model, 34.7 points apart, because of the attempt budget alone.
+  assert(not comparable(two, one, ""))
+  assert(string.contains(incomparable(two, one, ""), "attempt budgets"))
+  assert(result.is_err(delta(two, one, "")))
+
+  // Declaring attempts as the dimension under test makes it a legitimate comparison.
+  assert(comparable(two, one, "attempts"))
+  assert_eq(delta(two, one, "attempts"), ok(34.7))
+}
+
+test "variants and subsets are not the same number" {
+  let pro = score("swe-bench", "pro", "fable-5.1", 81.2, 731, AIDER)
+  let ver = score("swe-bench", "verified", "fable-5.1", 95.0, 731, AIDER)
+  assert(string.contains(incomparable(pro, ver, ""), "different variant"))
+
+  // A 56-exercise run is not a 225-exercise run, which is the error that nearly turned an
+  // 89.3% subset score into a claim about a full-set 72.0%.
+  let subset = score("aider-polyglot", "225", "glm-5.3-flash", 89.3, 56, AIDER)
+  let full = score("aider-polyglot", "225", "opus-4", 72.0, 225, AIDER)
+  assert(string.contains(incomparable(subset, full, ""), "different task counts"))
+}
+
+test "an unsourced score is refused" {
+  let ok_one = score("swe-bench", "pro", "a", 60.0, 731, AIDER)
+  let bare = Score { benchmark: "swe-bench", variant: "pro", model: "b", value: 80.0, n: 731, harness: AIDER, source: "" }
+  assert(string.contains(incomparable(ok_one, bare, ""), "no source"))
+}
+
+// The agentic composite, as published, and the exact case that produced the artifact.
+let AGENTIC = Definition {
+  name: "benchlm-agentic",
+  components: [
+    Component { benchmark: "terminal-bench", variant: "2.0", weight: 30.0 },
+    Component { benchmark: "browsecomp", variant: "", weight: 25.0 },
+    Component { benchmark: "osworld", variant: "verified", weight: 25.0 },
+    Component { benchmark: "osworld", variant: "2.0", weight: 10.0 },
+  ],
+  source: "https://benchlm.ai/agentic",
+}
+
+test "a composite says what it covered, and refuses a mismatched comparison" {
+  let h = Harness { attempts: 1, edit_format: "whole", reasoning: "max", tools: "all" }
+  let scores = [
+    // Kimi K3 has BrowseComp and no OSWorld-Verified.
+    score("browsecomp", "", "kimi-k3", 91.2, 1266, h),
+    score("terminal-bench", "2.0", "kimi-k3", 88.3, 89, h),
+    // Fable has OSWorld-Verified and no BrowseComp.
+    score("osworld", "verified", "fable-5", 85.0, 369, h),
+    score("terminal-bench", "2.0", "fable-5", 89.0, 89, h),
+  ]
+  let k = coverage("kimi-k3", AGENTIC, scores)
+  let f = coverage("fable-5", AGENTIC, scores)
+
+  // Each covers 55 of the 90 documented weight, but not the same 55.
+  assert_eq(list.len(k.missing), 2)
+  assert(list.contains(k.found, "browsecomp/"))
+  assert(list.contains(f.found, "osworld/verified"))
+
+  // So their difference is refused, by name.
+  let why = coverage_incomparable(k, f)
+  assert(string.contains(why, "average over different components"))
+  assert(string.contains(why, "browsecomp"))
+  assert(result.is_err(composite_delta(k, f)))
+
+  // Identical found-sets compare fine.
+  let g = coverage("kimi-k3", Definition { ...AGENTIC, components: [Component { benchmark: "terminal-bench", variant: "2.0", weight: 30.0 }] }, scores)
+  let g2 = coverage("fable-5", Definition { ...AGENTIC, components: [Component { benchmark: "terminal-bench", variant: "2.0", weight: 30.0 }] }, scores)
+  assert_eq(coverage_incomparable(g, g2), "")
+  // Compared with a tolerance, because 88.3 - 89.0 is not -0.7 in binary floating point.
+  match composite_delta(g, g2) {
+    ok(d) => { assert(near(d, -0.7, 0.001)); assert_eq(tenths(d), -0.7) },
+    err(_) => assert(false),
+  }
+}
+
+test "coverage renormalises to what it found and reports the shortfall" {
+  let h = Harness { attempts: 1, edit_format: "whole", reasoning: "", tools: "" }
+  let only_tb = [score("terminal-bench", "2.0", "m", 80.0, 89, h)]
+  let c = coverage("m", AGENTIC, only_tb)
+  // One component of 30 out of 90 documented weight.
+  assert_eq(c.value, 80.0)
+  assert(c.covered < 0.34 and c.covered > 0.33)
+  assert_eq(list.len(c.missing), 3)
+
+  // A model with nothing measured scores nothing, and says so rather than reporting 0%.
+  let none_found = coverage("ghost", AGENTIC, only_tb)
+  assert_eq(none_found.covered, 0.0)
+  assert_eq(list.len(none_found.found), 0)
+}
