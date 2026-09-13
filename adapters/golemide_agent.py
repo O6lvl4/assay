@@ -202,12 +202,36 @@ class GolemideAgent(BaseAgent):
 
     # --- run ---------------------------------------------------------------
 
+    async def _probe(self, environment: BaseEnvironment, command: str, *, timeout_sec: int,
+                     cwd: str | None = None):
+        """Run a command in the container for what it tells us, never for the trial's life.
+
+        Harbor raises out of `exec` on a timeout, and none of these probes caught it, so a
+        container that answered slowly took the whole trial with it: measured on
+        log-summary-date-ranges, `RuntimeError: Command timed out after 20 seconds` ended the
+        trial with no reward at all -- not a zero, an absence -- when the correct outcome was
+        for that one probe to say "no" and the next tier to be tried.
+
+        Returns None when the probe could not be run, which every caller must read as "this
+        tier abstains", distinct from a probe that ran and exited non-zero.
+        """
+        try:
+            if cwd is None:
+                return await environment.exec(command, timeout_sec=timeout_sec)
+            return await environment.exec(command, cwd=cwd, timeout_sec=timeout_sec)
+        except Exception as exc:  # harbor raises RuntimeError on timeout, and more besides
+            self.logger.warning(
+                "probe could not be run (%s: %s); treating it as no answer, not as a failure "
+                "of the task: %s", type(exc).__name__, exc, command[:200],
+            )
+            return None
+
     async def _discover_verify(self, environment: BaseEnvironment, root: str) -> str | None:
         for marker, command in _VERIFY_CANDIDATES:
-            probe = await environment.exec(
-                f"test -e {shlex.quote(f'{root}/{marker}')}", timeout_sec=20
+            probe = await self._probe(
+                environment, f"test -e {shlex.quote(f'{root}/{marker}')}", timeout_sec=20
             )
-            if probe.return_code == 0:
+            if probe is not None and probe.return_code == 0:
                 return command
         return None
 
@@ -245,9 +269,11 @@ class GolemideAgent(BaseAgent):
         `_stated_verify`, which asks a model to state the criteria and then checks that the
         criteria discriminate -- not another file-shape heuristic.
         """
-        probe = await environment.exec(
-            f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=20
+        probe = await self._probe(
+            environment, f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=20
         )
+        if probe is None:
+            return None
         names = [n.strip() for n in (probe.stdout or "").splitlines() if n.strip()]
         if not names:
             return None
@@ -452,7 +478,15 @@ class GolemideAgent(BaseAgent):
             return None
 
         # The measurement: criteria that pass before any edit are worthless.
-        probe = await environment.exec(candidate, cwd=root, timeout_sec=180)
+        probe = await self._probe(environment, candidate, cwd=root, timeout_sec=180)
+        if probe is None:
+            # Unvalidated criteria are worse than none: they can send golemide after a signal
+            # that was already satisfied, and its refusal then looks like inability.
+            self.logger.warning(
+                "could not run the stated criteria to see whether they already pass, so they "
+                "cannot be trusted; abstaining: %r", candidate
+            )
+            return None
         if probe.return_code == 0:
             self.logger.warning(
                 "stated criteria already pass on the untouched task, so they cannot guide "
@@ -512,8 +546,14 @@ class GolemideAgent(BaseAgent):
             # to work ("already passes -- nothing was changed") and the trial scored zero on a
             # criterion that could never have guided anything.
             if verify is not None:
-                probe = await environment.exec(verify, cwd=root, timeout_sec=180)
-                if probe.return_code == 0:
+                probe = await self._probe(environment, verify, cwd=root, timeout_sec=180)
+                if probe is None:
+                    self.logger.warning(
+                        "could not run the derived criteria to see whether they already pass, "
+                        "so they cannot be trusted; abstaining: %s", verify
+                    )
+                    verify = None
+                elif probe.return_code == 0:
                     self.logger.warning(
                         "derived criteria already pass on the untouched task, so they cannot "
                         "guide an edit; abstaining: %s", verify
