@@ -183,6 +183,68 @@ class GolemideAgent(BaseAgent):
                 return command
         return None
 
+    async def _derive_verify(self, environment: BaseEnvironment, root: str) -> str | None:
+        """A success signal built from what the task ships, when it ships no tests.
+
+        Terminal-Bench withholds its tests -- they are injected after the agent exits -- so
+        a loop that needs `--verify` has nothing to iterate against and does nothing at all.
+        That is what the first run measured: two trials, zero attempted.
+
+        Deriving one is legitimate rather than a way of scoring itself: Harbor grades the
+        container independently afterwards, so a weak or wrong signal here cannot inflate
+        the result. It can only fail to guide. The risk runs the other way -- a signal that
+        passes too easily makes golemide stop early -- so these are build-and-run checks,
+        the weakest claim that is still a claim: the code the task ships must still compile
+        and execute after the edit.
+
+        This is the honest floor, not the ideal. The ideal is a component that reads the
+        instruction, states acceptance criteria, and abstains when it cannot -- `emet`'s
+        entrance gate, which is designed and unbuilt.
+
+        And the floor is not high enough, which was worth measuring rather than assuming.
+        It fired on nothing across the two tasks tried, because Terminal-Bench tasks are not
+        shaped like exercises:
+
+            circuit-fibsqrt      /app = gates.txt, sim.c
+            make-mips-interpreter  /app = doom.wad, doomgeneric, doomgeneric_mips
+
+        The second one is "write a MIPS interpreter that can run Doom". No mechanical
+        build-and-run check means anything there; `cc` on a top-level `.c` is not even
+        applicable. Deriving a signal per task shape is a losing game on a benchmark whose
+        whole point is that the tasks do not share a shape.
+
+        So this function stays as the floor for simple tasks and is left deliberately
+        unextended. The gap it exposes is not a missing heuristic.
+        """
+        probe = await environment.exec(
+            f"ls -1 {shlex.quote(root)} 2>/dev/null", timeout_sec=20
+        )
+        names = [n.strip() for n in (probe.stdout or "").splitlines() if n.strip()]
+        if not names:
+            return None
+
+        def has(ext: str) -> str | None:
+            return next((n for n in names if n.endswith(ext)), None)
+
+        c_file = has(".c")
+        if c_file:
+            # Compile with warnings as information, then run it. A task whose program needs
+            # arguments will exit non-zero and that is still a usable signal: it separates
+            # "builds and runs" from "does not build".
+            return (
+                f"cc -O1 -o /tmp/_assay_build {shlex.quote(c_file)} 2>&1 && /tmp/_assay_build"
+            )
+        py_file = has(".py")
+        if py_file:
+            return f"python3 -c 'import py_compile,sys; py_compile.compile({py_file!r}, doraise=True)'"
+        rs_file = has(".rs")
+        if rs_file:
+            return f"rustc --edition 2021 -o /tmp/_assay_build {shlex.quote(rs_file)} && /tmp/_assay_build"
+        sh_file = has(".sh")
+        if sh_file:
+            return f"sh -n {shlex.quote(sh_file)}"
+        return None
+
     @override
     async def run(
         self,
@@ -200,13 +262,20 @@ class GolemideAgent(BaseAgent):
             root = ((await environment.exec("pwd")).stdout or "/").strip() or "/"
 
         verify = await self._discover_verify(environment, root)
+        derived = False
         if verify is None:
-            # Recorded, not substituted. A task whose tests cannot be found is a task this
-            # adapter cannot measure; a fallback that exits zero would score it as solved.
+            verify = await self._derive_verify(environment, root)
+            derived = verify is not None
+        if verify is None:
             self.logger.warning(
-                "no verify command found under %s; leaving this trial unattempted", root
+                "no verify command found or derivable under %s; leaving this trial "
+                "unattempted rather than looping against nothing", root
             )
             return
+        self.logger.info(
+            "verify (%s): %s", "derived from the task's files" if derived else "task's own",
+            verify,
+        )
 
         work = Path(tempfile.mkdtemp(prefix="golemide-harbor-"))
         try:
