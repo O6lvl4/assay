@@ -9,23 +9,35 @@ Published leaderboard numbers cannot answer "is this system better than Claude C
   two -- larger than the whole 3.5-Sonnet-to-Opus-4 span on the same benchmark);
 * the Claude models that ARE on the comparable coding leaderboards are from 2025-05, so
   beating them is not beating current Claude;
-* the agentic composite cannot be decomposed at all -- the model holding the published
-  80.2 appears on none of its own component leaderboards.
+* the agentic composite cannot be decomposed -- the model holding the published 80.2
+  appears on none of its own component leaderboards.
 
-Harbor removes all three at once. `claude-code` is a built-in agent, so both systems run
-on the same 89 tasks, in the same containers, on the same day, and the comparison needs no
+Harbor removes all three at once. `claude-code` is a built-in agent, so both systems run on
+the same 89 tasks, in the same containers, on the same day, and the comparison needs no
 published figure. See ../DESIGN.md for the measurements behind each claim.
 
-How it works
-------------
-golemide is a native binary that takes a directory and a verify command and runs an
-edit/verify loop until the command exits zero. Harbor runs agents inside the task
-container, so the binary has to be a Linux one: built from the Almide release's
-`almide-linux-aarch64` toolchain, uploaded in `setup`, and executed in `run`.
+How it works, and why it is not the obvious way
+-----------------------------------------------
+The obvious design is to upload a Linux golemide into the task container. That was built
+and abandoned after three measured failures, each caught before any model call:
 
-The verify command is the task's own test entrypoint, discovered in the container rather
-than assumed, because a wrong verify command silently measures nothing -- the loop stops on
-the first thing that exits zero.
+1. the aarch64 build hit "cannot execute: required file not found" -- Terminal-Bench images
+   are x86_64 even on an arm64 host, which runs them under emulation;
+2. the x86_64 build hit "GLIBC_2.39 not found" -- the task image is Debian 12 (glibc 2.36)
+   while the Almide release toolchain links against 2.39;
+3. building Almide from source against 2.36 exhausted the machine's memory under emulation,
+   and `CARGO_BUILD_TARGET=...-musl` is ignored by `almide build`, so the static binary that
+   would sidestep glibc entirely is not available.
+
+So golemide runs on the HOST, where its native binary already works, and only the verify
+command crosses into the container. That is a fit rather than a workaround: golemide's whole
+interface is a directory plus a shell command whose exit status defines success, so the
+container boundary lands exactly on the shell command.
+
+The bridge: a container's hostname is its short id in Docker (verified), so the host can
+reach it with `docker exec`. Each verify pushes the host's working copy in with `docker cp`
+and then runs the task's own tests inside, which keeps the two trees in step without
+golemide knowing anything about containers.
 
 Usage
 -----
@@ -34,15 +46,45 @@ Usage
            -d terminal-bench/terminal-bench-2 \
            -l 5 -n 2
 
-`GOLEMIDE_BINARY` points at the Linux build. Cloudflare credentials are read from the
-host environment and forwarded into the container, never written to disk in it.
+`GOLEMIDE_BINARY` points at the host build. Cloudflare credentials are read from the host
+environment; they never enter the container, because golemide never runs there.
+
+What this adapter found, and why it cannot be fixed here
+--------------------------------------------------------
+The bridge works. Two trials completed with no exceptions, and both scored zero for one
+reason, logged verbatim:
+
+    no verify command found under /app; leaving this trial unattempted
+
+Not a discovery bug. The task container holds `gates.txt` and `sim.c` and **no tests at
+all** -- Harbor injects and runs them after the agent exits, which is how the oracle agent
+scores 1.0. Terminal-Bench withholds the success signal on purpose.
+
+golemide's entire interface is `--verify CMD`, "the command whose exit status defines
+success". On this benchmark no such command exists for the agent to have. So golemide
+cannot compete here as designed, and no amount of adapter work changes that: the benchmark
+measures the one thing golemide delegates to its caller -- deciding when the job is done,
+without being told.
+
+That is the same gap `emet`'s design document names as its entrance gate: "the entrance
+asks whether a request can be turned into acceptance criteria". It was written down as the
+missing piece before this run measured it.
+
+So the honest boundary: a test-driven loop can be made cheaper, more careful and better
+targeted -- all measured, all real -- and it still cannot enter a benchmark that refuses to
+tell it what passing means. Closing that needs a component that manufactures acceptance
+criteria from prose and abstains when it cannot, which is a different program from this one.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import os
 import re
 import shlex
+import shutil
+import tempfile
 from pathlib import Path
 from typing import override
 
@@ -56,14 +98,9 @@ _COST = re.compile(r"\$([0-9]+\.[0-9]+)")
 _TOKENS_IN = re.compile(r"\bin=([0-9]+)")
 _TOKENS_OUT = re.compile(r"\bout=([0-9]+)")
 
-# Where the binary lands in the container. /usr/local/bin is on PATH in every image the
-# Terminal-Bench tasks use, but the path is explicit at the call site anyway so a task
-# with an unusual PATH cannot change what runs.
-_REMOTE_BIN = "/usr/local/bin/golemide"
-
 # Candidate verify commands, most specific first. Discovered by probing the container, not
-# assumed: golemide stops at the first command that exits zero, so handing it a command
-# that trivially passes would make every task look solved.
+# assumed: golemide stops at the first command that exits zero, so a command that trivially
+# passes would score every task as solved.
 _VERIFY_CANDIDATES: list[tuple[str, str]] = [
     ("run-tests.sh", "bash run-tests.sh"),
     ("tests/run-tests.sh", "bash tests/run-tests.sh"),
@@ -77,9 +114,13 @@ _VERIFY_CANDIDATES: list[tuple[str, str]] = [
 
 
 class GolemideAgent(BaseAgent):
-    """golemide, driven inside a Harbor task container."""
+    """golemide on the host, with its verify command bridged into the task container."""
 
     capabilities = AgentCapabilities()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._container: str | None = None
 
     @staticmethod
     @override
@@ -88,51 +129,52 @@ class GolemideAgent(BaseAgent):
 
     @override
     def version(self) -> str | None:
-        # The binary's own identity, so a result can be traced to a build.
-        binary = os.environ.get("GOLEMIDE_BINARY", "")
-        if not binary:
-            return None
-        try:
-            return Path(binary).stat().st_mtime.__str__()
-        except OSError:
-            return None
+        # A content hash, not a timestamp: two builds of one source must compare equal, and
+        # a changed source must not be able to report an unchanged version.
+        path = os.environ.get("GOLEMIDE_BINARY")
+        if path and Path(path).is_file():
+            digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()[:12]
+            return f"{Path(path).name}@{digest}"
+        return None
+
+    async def _host(self, *argv: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        return proc.returncode or 0, stdout.decode(errors="replace")
 
     # --- setup -------------------------------------------------------------
 
     @override
     async def setup(self, environment: BaseEnvironment) -> None:
         binary = os.environ.get("GOLEMIDE_BINARY")
-        if not binary:
+        if not binary or not Path(binary).is_file():
             raise RuntimeError(
-                "GOLEMIDE_BINARY is unset. It must point at a Linux build of golemide "
-                "matching the container architecture; a macOS binary will upload fine and "
-                "then fail to execute, which looks like the agent solving nothing."
+                "GOLEMIDE_BINARY must point at a golemide build for THIS host (golemide "
+                f"runs on the host, not in the container). Got: {binary!r}"
             )
-        src = Path(binary)
-        if not src.is_file():
-            raise RuntimeError(f"GOLEMIDE_BINARY does not exist: {src}")
 
-        await environment.upload_file(src, _REMOTE_BIN)
-        await environment.exec(f"chmod +x {shlex.quote(_REMOTE_BIN)}")
+        # The container's hostname is its short id, which is how the host reaches it.
+        probe = await environment.exec("hostname", timeout_sec=20)
+        cid = (probe.stdout or "").strip()
+        if not cid:
+            raise RuntimeError("could not read the container's hostname; no way to bridge")
+        self._container = cid
 
-        # Fail here rather than mid-run: a binary built for the wrong architecture reports
-        # "Exec format error", and finding that out per-task wastes the whole job.
-        #
-        # `observe` is the probe because it is the only subcommand that exits zero without
-        # calling a model. `--help` exits 1 (golemide has no such flag and treats it as an
-        # unknown command), which as a probe would have failed every task in the job while
-        # looking like an architecture problem.
-        probe = await environment.exec(f"{shlex.quote(_REMOTE_BIN)} observe --root /tmp")
-        if probe.return_code != 0:
+        # Prove the bridge before a task depends on it: a `docker exec` that fails later
+        # would look like golemide being unable to solve anything.
+        rc, out = await self._host("docker", "exec", cid, "true")
+        if rc != 0:
             raise RuntimeError(
-                f"golemide will not execute in this container (exit {probe.return_code}). "
-                f"Check the binary's architecture.\n{probe.stdout}\n"
+                f"cannot `docker exec` into {cid} from the host (exit {rc}): {out.strip()}"
             )
 
     # --- run ---------------------------------------------------------------
 
     async def _discover_verify(self, environment: BaseEnvironment, root: str) -> str | None:
-        """The task's own test entrypoint, found by looking rather than guessing."""
         for marker, command in _VERIFY_CANDIDATES:
             probe = await environment.exec(
                 f"test -e {shlex.quote(f'{root}/{marker}')}", timeout_sec=20
@@ -148,59 +190,77 @@ class GolemideAgent(BaseAgent):
         environment: BaseEnvironment,
         context: AgentContext,
     ) -> None:
-        root = "/app"
-        if not await environment.is_dir(root):
-            probe = await environment.exec("pwd")
-            root = (probe.stdout or "/").strip() or "/"
+        cid = self._container
+        if cid is None:
+            raise RuntimeError("setup did not run")
+
+        if await environment.is_dir("/app"):
+            root = "/app"
+        else:
+            root = ((await environment.exec("pwd")).stdout or "/").strip() or "/"
 
         verify = await self._discover_verify(environment, root)
         if verify is None:
-            # Recorded, not silently substituted. A task whose tests this adapter cannot
-            # find is a task this adapter cannot measure, and saying so is the only honest
-            # outcome -- a fallback command that exits zero would score it as solved.
+            # Recorded, not substituted. A task whose tests cannot be found is a task this
+            # adapter cannot measure; a fallback that exits zero would score it as solved.
             self.logger.warning(
-                "no verify command found under %s; golemide needs one to have a success "
-                "signal, so this trial is left unattempted", root
+                "no verify command found under %s; leaving this trial unattempted", root
             )
             return
 
-        creds = {
-            k: v
-            for k, v in os.environ.items()
-            if k in ("CLOUDFLARE_ACCOUNT_ID", "CLOUDFLARE_API_TOKEN")
-        }
-        if not creds:
-            raise RuntimeError(
-                "no Cloudflare credentials in the host environment; golemide cannot reach "
-                "a model and every task would fail for a reason unrelated to the agent"
+        work = Path(tempfile.mkdtemp(prefix="golemide-harbor-"))
+        try:
+            local = work / "src"
+            await environment.download_dir(root, local)
+
+            # The verify command golemide runs on the host: push the working copy into the
+            # container, then run the task's own tests there. The exit status passes through
+            # untouched, so golemide's success signal is the container's, not the host's.
+            script = work / "verify.sh"
+            script.write_text(
+                "#!/bin/sh\n"
+                f"docker cp {shlex.quote(str(local))}/. "
+                f"{cid}:{shlex.quote(root)}/ >/dev/null 2>&1 || exit 111\n"
+                f"docker exec -w {shlex.quote(root)} {cid} sh -lc {shlex.quote(verify)}\n"
+                "exit $?\n"
             )
+            script.chmod(0o755)
 
-        model = self.model_name or "cf:glm-5.3"
-        command = (
-            f"{shlex.quote(_REMOTE_BIN)} solve {shlex.quote(instruction)} "
-            f"--root {shlex.quote(root)} --verify {shlex.quote(verify)} "
-            f"--model {shlex.quote(model)} --attempts 6"
-        )
+            command = [
+                os.environ["GOLEMIDE_BINARY"],
+                "solve",
+                instruction,
+                "--root", str(local),
+                "--verify", str(script),
+                "--model", self.model_name or "cf:glm-5.3",
+                "--attempts", "6",
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=dict(os.environ),
+            )
+            stdout, _ = await proc.communicate()
+            out = stdout.decode(errors="replace")
+            (self.logs_dir / "golemide.log").write_text(out)
 
-        result = await environment.exec(
-            command,
-            cwd=root,
-            env=creds,
-            timeout_sec=None,
-        )
+            # The final state has to be in the container, because that is what Harbor
+            # grades. The verify script syncs on every attempt, but a run that ends without
+            # a passing verify would otherwise leave the last edit on the host only.
+            await self._host("docker", "cp", f"{local}/.", f"{cid}:{root}/")
 
-        out = (result.stdout or "") + "\n" + (getattr(result, "stderr", "") or "")
-        (self.logs_dir / "golemide.log").write_text(out)
-
-        # Harbor grades the container, not golemide's own verdict, so nothing here decides
-        # pass or fail. What it does record is the cost, which is the number this project
-        # has been able to move: -38% to -41.5% per attempt across three measured A/Bs.
-        costs = _COST.findall(out)
-        if costs:
-            context.cost_usd = float(costs[-1])
-        tin = _TOKENS_IN.findall(out)
-        if tin:
-            context.n_input_tokens = int(tin[-1])
-        tout = _TOKENS_OUT.findall(out)
-        if tout:
-            context.n_output_tokens = int(tout[-1])
+            # Harbor grades the container, so nothing here decides pass or fail. What this
+            # records is cost -- the quantity this project has actually moved (-38% to
+            # -41.5% per attempt across three measured A/Bs).
+            costs = _COST.findall(out)
+            if costs:
+                context.cost_usd = float(costs[-1])
+            tin = _TOKENS_IN.findall(out)
+            if tin:
+                context.n_input_tokens = int(tin[-1])
+            tout = _TOKENS_OUT.findall(out)
+            if tout:
+                context.n_output_tokens = int(tout[-1])
+        finally:
+            shutil.rmtree(work, ignore_errors=True)

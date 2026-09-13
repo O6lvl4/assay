@@ -84,3 +84,46 @@ Terminal-Bench 2.0 が30%、BrowseComp 25%、OSWorld-Verified 25%、OSWorld 2.0 
 - https://benchlm.ai/agentic — 合成スコアの重みと "normalized by available weights"
 - https://benchlm.ai/benchmarks/browsecomp ・ https://benchlm.ai/benchmarks/osworld-verified — 掲載モデルの非対称
 - https://llm-stats.com/benchmarks/swe-bench-verified ・ SWE-bench Pro リーダーボード
+
+## 測って出た、構造的な壁
+
+Terminal-Bench 2.0（合成の30%、89タスク）に golemide を繋いで走らせた結果。
+アダプタは通り、2試行が例外なく完走し、両方ゼロ点。理由はログにそのまま出ている:
+
+    no verify command found under /app; leaving this trial unattempted
+
+発見ロジックの不具合ではない。タスクコンテナには `gates.txt` と `sim.c` があり、
+**テストが一つも無い**。harbor はエージェント終了後にテストを注入して採点する
+（oracle が 1.0 を取るのはその経路）。**Terminal-Bench は成功信号を意図的に渡さない。**
+
+golemide のインターフェースは全体が `--verify CMD` —「終了ステータスが成否を定義する
+コマンド」。このベンチにはエージェントが持てるそんなコマンドが存在しない。だから
+golemide は設計上ここで競えず、アダプタをいくら作り込んでも変わらない。
+**このベンチが測っているのは、golemide が呼び出し側に委ねている唯一のもの** —
+教えられずに「終わった」と判断すること。
+
+これは [emet](https://github.com/O6lvl4/emet) の設計文書が入口ゲートとして名指している
+差と同じもの:「入口は、要求を受け入れ基準に変えられるかを問う」。測る前に、
+欠けている部品として書かれていた。
+
+正直な境界線はここ。テスト駆動のループは、より安く・より慎重に・より的を絞って
+動かせる（すべて実測済み・すべて本物）。それでも、**何が合格かを教えることを拒む
+ベンチには入れない。** それを閉じるには、散文から受け入れ基準を作り、作れないときは
+棄権する部品が要る。これはこのプログラムとは別のプログラムである。
+
+### 経路の実測値（記録用）
+
+| | |
+|---|---|
+| oracle 1タスク | reward 1.000 / 1分45秒 / $0 |
+| golemide 2タスク | 例外0 / reward 0.0 / 3分47秒 / 未実施のため$0 |
+| 到達不能の理由 | 受け入れ基準がコンテナ内に存在しない |
+
+到達までに潰した非互換（すべてモデル呼び出し前に検出、合計$0）:
+Python 3.14 は terminal-bench が PEP 649 非対応 → 3.12 /
+`terminal-bench` パッケージに 2.0 は無い → `harbor` /
+aarch64 バイナリはタスクが x86_64 で動かず /
+x86_64 は GLIBC_2.39 リンクでタスクは 2.36 /
+bookworm での almide ソースビルドはメモリ不足 /
+`CARGO_BUILD_TARGET=musl` は `almide build` に無視される →
+**ホスト実行＋`docker exec` 橋渡しに設計変更**
