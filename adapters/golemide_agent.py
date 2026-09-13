@@ -506,12 +506,30 @@ class GolemideAgent(BaseAgent):
             # then keep them only if they fail on the untouched task.
             verify = await self._stated_verify(instruction, environment, root)
             source = "stated from the instruction"
+        attempts = "6"
         if verify is None:
+            # Acting without a success signal, which is what this benchmark actually asks
+            # for. The three tiers above all abstained, and abstaining means golemide does
+            # nothing and scores zero honestly -- correct behaviour for a loop built around
+            # having an oracle, and still zero.
+            #
+            # So the last resort inverts the premise: a verify that always reports "not
+            # done" turns the loop into N best-effort passes. golemide reads the
+            # instruction, edits, is told it is not finished, and edits again with its own
+            # diff in the history. It never believes it is done; Harbor decides that
+            # afterwards, which it was going to do regardless.
+            #
+            # Attempts are capped low here on purpose. With no signal there is nothing to
+            # tell improvement from thrash, and a loop that cannot perceive progress should
+            # not be given six chances to churn the same files.
+            verify = "/bin/false"
+            source = "NONE -- acting without a success signal, best effort only"
+            attempts = "2"
             self.logger.warning(
-                "no verify command found or derivable under %s; leaving this trial "
-                "unattempted rather than looping against nothing", root
+                "no criteria could be discovered, derived or stated for %s; running %s "
+                "best-effort passes with no success signal instead of not attempting",
+                root, attempts,
             )
-            return
         self.logger.info("verify (%s): %s", source, verify)
 
         work = Path(tempfile.mkdtemp(prefix="golemide-harbor-"))
@@ -539,34 +557,53 @@ class GolemideAgent(BaseAgent):
                 "--root", str(local),
                 "--verify", str(script),
                 "--model", self.model_name or "cf:glm-5.3",
-                "--attempts", "6",
+                "--attempts", attempts,
             ]
-            proc = await asyncio.create_subprocess_exec(
-                *command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=dict(os.environ),
-            )
-            stdout, _ = await proc.communicate()
-            out = stdout.decode(errors="replace")
-            (self.logs_dir / "golemide.log").write_text(out)
+            # Write straight to the log file rather than buffering through a pipe. Harbor
+            # kills an agent at its own timeout (1800s), and `communicate()` holds everything
+            # in memory until the process exits -- so a timed-out run lost its entire log,
+            # including the cost line. A 30-minute run's spend became unreportable, which is
+            # the one kind of missing record that cannot be reconstructed afterwards.
+            log_path = self.logs_dir / "golemide.log"
+            try:
+                with open(log_path, "wb") as sink:
+                    proc = await asyncio.create_subprocess_exec(
+                        *command,
+                        stdout=sink,
+                        stderr=asyncio.subprocess.STDOUT,
+                        env=dict(os.environ),
+                    )
+                    try:
+                        await proc.wait()
+                    except asyncio.CancelledError:
+                        # Killed from outside (Harbor's timeout). Reap the child first so it
+                        # cannot outlive the trial and keep spending.
+                        proc.kill()
+                        await proc.wait()
+                        raise
+            finally:
+                # Cost is recorded even when the run was killed, which is the whole point of
+                # this restructuring: money was spent either way, and the timed-out case is
+                # exactly the one where the old code lost the record.
+                out = log_path.read_text(errors="replace") if log_path.exists() else ""
+                costs = _COST.findall(out)
+                if costs:
+                    context.cost_usd = float(costs[-1])
+                tin = _TOKENS_IN.findall(out)
+                if tin:
+                    context.n_input_tokens = int(tin[-1])
+                tout = _TOKENS_OUT.findall(out)
+                if tout:
+                    context.n_output_tokens = int(tout[-1])
+                if not costs:
+                    self.logger.warning(
+                        "no cost line in golemide's output (%d bytes); spend for this trial "
+                        "is unrecorded", len(out)
+                    )
 
             # The final state has to be in the container, because that is what Harbor
             # grades. The verify script syncs on every attempt, but a run that ends without
             # a passing verify would otherwise leave the last edit on the host only.
             await self._host("docker", "cp", f"{local}/.", f"{cid}:{root}/")
-
-            # Harbor grades the container, so nothing here decides pass or fail. What this
-            # records is cost -- the quantity this project has actually moved (-38% to
-            # -41.5% per attempt across three measured A/Bs).
-            costs = _COST.findall(out)
-            if costs:
-                context.cost_usd = float(costs[-1])
-            tin = _TOKENS_IN.findall(out)
-            if tin:
-                context.n_input_tokens = int(tin[-1])
-            tout = _TOKENS_OUT.findall(out)
-            if tout:
-                context.n_output_tokens = int(tout[-1])
         finally:
             shutil.rmtree(work, ignore_errors=True)
