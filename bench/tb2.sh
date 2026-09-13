@@ -47,7 +47,13 @@ args=(run -a adapters.golemide_agent:GolemideAgent -m "$MODEL"
       -k "$ATTEMPTS" -n "$CONCURRENT"
       --agent-timeout-multiplier "$AGENT_TIMEOUT_MULT"
       -o "$JOBS_DIR" -y)
-for t in "${TASKS[@]+"${TASKS[@]}"}"; do args+=(-i "$t"); done
+# -i matches the task's full name, org prefix included: `terminal-bench/fix-git`, not
+# `fix-git`. A bare name matches nothing and harbor raises before any trial starts, so the
+# whole run fails in a second -- which is what the pilot is for, but the prefix belongs here
+# rather than in every caller's argument list.
+for t in "${TASKS[@]+"${TASKS[@]}"}"; do
+  case "$t" in */*) args+=(-i "$t") ;; *) args+=(-i "terminal-bench/$t") ;; esac
+done
 
 echo "model=$MODEL concurrent=$CONCURRENT attempts=$ATTEMPTS timeout_mult=$AGENT_TIMEOUT_MULT"
 echo "tasks: ${TASKS[*]-<all 89>}"

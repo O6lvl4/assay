@@ -580,6 +580,11 @@ class GolemideAgent(BaseAgent):
                 # only way the agent learns anything beyond the file listing, and it is what
                 # the no-signal tier is otherwise missing.
                 "--explore", os.environ.get("GOLEMIDE_EXPLORE", "1"),
+                # Many of these tasks have nothing to repair: the instruction says "create
+                # /app/filter.py" and the container ships no source at all. Without this,
+                # golemide refuses before calling the model -- which is how three of the ten
+                # pilot tasks ended in under 45 seconds for $0.00 and a reward of zero.
+                "--create",
             ]
             # Write straight to the log file rather than buffering through a pipe. Harbor
             # kills an agent at the timeout the TASK declares -- `[agent] timeout_sec` in its
