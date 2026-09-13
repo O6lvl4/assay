@@ -1,3 +1,5 @@
 assay
 *.wasm
 target/
+golemide-linux-*
+__pycache__/
