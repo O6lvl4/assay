@@ -72,10 +72,24 @@ So the verify command is sought in three tiers, weakest claim last:
 2. `_derive_verify` -- build-and-run on the files present. Measured to fire on neither task
    tried: Terminal-Bench tasks do not share a shape ("write a MIPS interpreter that runs
    Doom" has no mechanical build check), so this is the floor and is left unextended;
-3. `_stated_verify` -- ask a model to state the criteria, then **run them on the untouched
-   task and keep them only if they fail**. A criterion that passes before any edit cannot
-   guide an edit. That check is a measurement, not a judgement of the model's answer, which
-   is the distinction `emet` is built on.
+3. `_stated_verify` -- `emet`'s entrance gate, at the smallest size that is still the real
+   thing. Three independent readings of the request are sampled, and the criteria are used
+   only if a majority of them test THE SAME THING (compared by which programs they invoke
+   and which paths they touch, not by wording). Then the survivor must fail on the untouched
+   task, and must not be an implementation in disguise.
+
+Each of those three checks exists because a weaker version was measured and found wanting:
+
+* a single answer can only be checked for whether it runs, and "it runs" is not "it is the
+  right check";
+* a criterion that already passes cannot guide an edit;
+* asked for a check on an open-ended task, the model returns the SOLUTION as a heredoc
+  (`cat > mips.c <<EOF ...`) -- measured, and the reason the shape test is there.
+
+The sampling is the part that makes this a gate rather than a guess: it measures the
+REQUEST's determinacy, not the answer's correctness. If three readings disagree about what
+the task even checks, the request could not be turned into criteria and abstaining is the
+honest outcome.
 
 Nothing in tier 3 can inflate a score: Harbor grades the container independently afterwards,
 so stated criteria can only guide or waste attempts, never award them. Abstaining is
@@ -106,6 +120,11 @@ from harbor.models.agent.context import AgentContext
 _COST = re.compile(r"\$([0-9]+\.[0-9]+)")
 _TOKENS_IN = re.compile(r"\bin=([0-9]+)")
 _TOKENS_OUT = re.compile(r"\bout=([0-9]+)")
+
+# How many independent readings of the request to take before trusting any of them.
+# Three is the smallest number that can show a majority AND a split; two can only agree
+# or tie, which cannot distinguish "determinate" from "ambiguous".
+_CRITERIA_SAMPLES = 3
 
 # Candidate verify commands, most specific first. Discovered by probing the container, not
 # assumed: golemide stops at the first command that exits zero, so a command that trivially
@@ -255,6 +274,86 @@ class GolemideAgent(BaseAgent):
             return f"sh -n {shlex.quote(sh_file)}"
         return None
 
+    @staticmethod
+    def _criteria_signature(command: str) -> frozenset[str]:
+        """What a candidate check actually looks at, as a comparable set.
+
+        Two checks that invoke different programs against different files are two different
+        interpretations of the request, however similar their prose. Comparing raw strings
+        would call every rewording a disagreement and every coincidence an agreement; this
+        compares the executables named and the paths touched, which is what the check does.
+        """
+        words = re.findall(r"[A-Za-z0-9_./-]+", command)
+        interesting = set()
+        for w in words:
+            if w in {"-c", "-e", "&&", "||", ";", "set", "sh", "bash", "exit", "$?", "then", "fi"}:
+                continue
+            if w.startswith("-"):
+                continue
+            if "." in w or "/" in w or w.isalpha():
+                interesting.add(w.lower().lstrip("./"))
+        return frozenset(interesting)
+
+    async def _sample_criteria(self, prompt: str, k: int) -> list[str]:
+        """k independent statements of the criteria, for measuring their stability."""
+        account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
+        token = os.environ.get("CLOUDFLARE_API_TOKEN")
+        url = (
+            f"https://api.cloudflare.com/client/v4/accounts/{account}"
+            "/ai/run/@cf/zai-org/glm-5.3-flash"
+        )
+        out: list[str] = []
+        for _ in range(k):
+            body = json.dumps(
+                {
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 8192,
+                    "reasoning_effort": "low",
+                    # Sampling, not greedy: k identical answers from a deterministic decode
+                    # would measure nothing about the request.
+                    "temperature": 0.7,
+                }
+            ).encode()
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=240) as resp:
+                    payload = json.loads(resp.read().decode())
+            except Exception as exc:
+                self.logger.warning("a criteria sample failed: %s", exc)
+                continue
+            result = payload.get("result") or {}
+            text = result.get("response") or ""
+            choices = result.get("choices") or []
+            if not text and choices:
+                text = ((choices[0] or {}).get("message") or {}).get("content") or ""
+            if not text.strip():
+                # The third silent abstention of this kind, so it is logged like the others:
+                # an empty content field looked identical to "the model declined", and the
+                # cause was upstream both times (response shape, then token budget).
+                self.logger.warning(
+                    "a criteria sample returned no content (finish_reason=%s)",
+                    ((choices or [{}])[0] or {}).get("finish_reason"),
+                )
+                continue
+            picked = ""
+            for line in text.strip().splitlines():
+                line = line.strip().strip("`")
+                if line and not line.startswith("#"):
+                    picked = line
+                    break
+            if picked:
+                out.append(picked)
+            else:
+                self.logger.warning("a criteria sample had no usable line: %.80s", text)
+        return out
+
     async def _stated_verify(
         self, instruction: str, environment: BaseEnvironment, root: str
     ) -> str | None:
@@ -296,7 +395,11 @@ class GolemideAgent(BaseAgent):
             "it is incomplete. It runs in the project directory. It must actually test the "
             "work: a command that always succeeds is useless. No explanation, no markdown, "
             "no backticks.\n\n"
-            f"TASK:\n{instruction[:3000]}\n\nFILES:\n{listing[:2000]}\n"
+            # Trimmed hard. A 3000-character instruction plus a 2000-character listing made
+            # the model reason long enough to blow both the token budget and the request
+            # timeout; the same prompt at these sizes answers in about two seconds. What the
+            # gate needs is the task's OBJECT, not its full prose.
+            f"TASK:\n{instruction[:1200]}\n\nFILES:\n{listing[:800]}\n"
         )
         # `max_tokens` covers the reasoning as well as the answer, and glm-5.3-flash spends
         # it on `reasoning_content` first. At 300 tokens it returned finish_reason "length"
@@ -310,52 +413,38 @@ class GolemideAgent(BaseAgent):
         # budget to 16384 without it timed out instead. Stating a check does not need deep
         # reasoning; the check's quality is decided by the discriminate test below, not by
         # how long the model thought about it.
-        body = json.dumps(
-            {
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 8192,
-                "reasoning_effort": "low",
-            }
-        ).encode()
-        url = (
-            f"https://api.cloudflare.com/client/v4/accounts/{account}"
-            "/ai/run/@cf/zai-org/glm-5.3-flash"
-        )
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
-                payload = json.loads(resp.read().decode())
-        except Exception as exc:  # network, auth, rate limit -- all mean "no criteria"
-            self.logger.warning("could not state criteria: %s", exc)
-            return None
-
-        # Workers AI answers in either shape depending on the model: a bare `response`, or
-        # OpenAI-style `choices[].message.content`. glm-5.3-flash uses the latter, and
-        # reading only the former was a silent empty string.
-        result = payload.get("result") or {}
-        text = result.get("response") or ""
-        if not text:
-            choices = result.get("choices") or []
-            if choices:
-                text = ((choices[0] or {}).get("message") or {}).get("content") or ""
-        if not text:
+        # k interpretations, then agreement. This is the gate: a single answer cannot be
+        # checked for anything except whether it runs, and "it runs" is not "it is the right
+        # check". Sampling measures the REQUEST -- if three independent readings of it test
+        # different things, the request was not determinate enough to turn into criteria, and
+        # the honest move is to abstain rather than pick one and call it the goal.
+        samples = await self._sample_criteria(prompt, _CRITERIA_SAMPLES)
+        if len(samples) < 2:
             self.logger.warning(
-                "the model returned no content for the criteria (finish_reason=%s); abstaining",
-                ((result.get("choices") or [{}])[0] or {}).get("finish_reason"),
+                "only %d criteria sample(s) came back; not enough to measure agreement, "
+                "abstaining", len(samples)
             )
             return None
-        candidate = ""
-        for line in text.strip().splitlines():
-            line = line.strip().strip("`")
-            if line and not line.startswith("#"):
-                candidate = line
-                break
-        if not candidate:
+
+        groups: dict[frozenset[str], list[str]] = {}
+        for s in samples:
+            groups.setdefault(self._criteria_signature(s), []).append(s)
+        best_sig, best = max(groups.items(), key=lambda kv: len(kv[1]))
+        if len(best) * 2 <= len(samples):
+            # No majority: the readings disagree about what the task even checks.
+            self.logger.warning(
+                "%d samples produced %d different interpretations with no majority; the "
+                "request is not determinate enough to state criteria, abstaining: %s",
+                len(samples), len(groups),
+                " | ".join(sorted(",".join(sorted(g)) for g in groups)[:3]),
+            )
             return None
+
+        candidate = best[0]
+        self.logger.info(
+            "criteria agreed by %d/%d samples on %s", len(best), len(samples),
+            ",".join(sorted(best_sig)) or "(nothing identifiable)",
+        )
 
         # Refuse the shapes that cannot discriminate by construction.
         if re.fullmatch(r"(true|:|exit\s+0|/bin/true)\s*;?", candidate):
