@@ -1,0 +1,147 @@
+// What can actually be run, as opposed to what scores well. Verified against the
+// Cloudflare Workers AI model catalogue on 2026-09-13: 31 text-generation models.
+//
+// A leaderboard answers "which model is best". It does not answer "which model can this
+// project deploy", and the two answers differ at the top: the open-weight model that leads
+// Terminal-Bench 2.0 is not one we can call. Without this file the question "is Kimi K3
+// required?" gets answered from the score table, which says yes; the true answer is that
+// the score table is not the constraint.
+//
+// Reachability is a property of our infrastructure and a date, not of the model, so it is
+// kept out of `published` -- whose own rule is that a row must come off a benchmark's
+// leaderboard. Here the source is an API listing, and it will go stale; the date says when.
+
+import self.score
+import self.published
+
+let CATALOGUE = "GET /accounts/:id/ai/models/search (task = Text Generation)"
+let VERIFIED_ON = "2026-09-13"
+
+type Deployment = { model: String, path: String }
+
+// Only the instruction-following and coding models are listed; the catalogue also carries
+// embedding, classification and image models that no agent loop can use.
+let WORKERS_AI: List[Deployment] = [
+  Deployment { model: "glm-5.3",        path: "@cf/zai-org/glm-5.3" },
+  Deployment { model: "glm-5.3-flash",  path: "@cf/zai-org/glm-5.3-flash" },
+  Deployment { model: "glm-5.2",        path: "@cf/zai-org/glm-5.2" },
+  Deployment { model: "glm-4.7-flash",  path: "@cf/zai-org/glm-4.7-flash" },
+  Deployment { model: "kimi-k2.7-code", path: "@cf/moonshotai/kimi-k2.7-code" },
+  Deployment { model: "kimi-k2.6",      path: "@cf/moonshotai/kimi-k2.6" },
+  Deployment { model: "qwen3.8-27b",    path: "@cf/qwen/qwen3.8-27b" },
+  Deployment { model: "qwen3-30b-a3b",  path: "@cf/qwen/qwen3-30b-a3b-fp8" },
+  Deployment { model: "qwq-32b",        path: "@cf/qwen/qwq-32b" },
+  Deployment { model: "qwen2.5-coder-32b", path: "@cf/qwen/qwen2.5-coder-32b-instruct" },
+  Deployment { model: "deepseek-v4-pro",   path: "@cf/deepseek-ai/deepseek-v4-pro-0813" },
+  Deployment { model: "deepseek-v4-flash", path: "@cf/deepseek-ai/deepseek-v4-flash-0731" },
+  Deployment { model: "llama-4-scout",  path: "@cf/meta/llama-4-scout-17b-16e-instruct" },
+]
+
+// Models that hold a row in `published` but cannot be called here. Recorded for the same
+// reason `published.ABSENCES` is: a reader who cannot see the gap will plan around a score
+// they have no way to reproduce.
+type Unreachable = { model: String, note: String }
+let UNREACHABLE: List[Unreachable] = [
+  Unreachable { model: "kimi-k3",
+    note: "leads Terminal-Bench 2.0 at 88.3, above every listed Claude. Not in the Workers AI catalogue on " + VERIFIED_ON + "; the newest Moonshot entries are kimi-k2.7-code and kimi-k2.6. So the one open-weight score that clears the top Claude is not a score this project can stand on" },
+  Unreachable { model: "qwen3.8-max",
+    note: "leads OSWorld-Verified at 86.1. The catalogue carries qwen3.8-27b, a different model; -max is hosted only by its vendor" },
+]
+
+fn deployment(model: String) -> Deployment? =
+  list.find(WORKERS_AI, (d) => d.model == model)
+
+fn reachable(model: String) -> Bool =
+  match deployment(model) { some(_) => true, none => false }
+
+fn unreachable(model: String) -> Unreachable? =
+  list.find(UNREACHABLE, (u) => u.model == model)
+
+// The highest published score on one benchmark among models we can actually call. This is
+// the number a plan may be built on; the leaderboard maximum is not.
+fn best_reachable(bm: String, variant: String) -> score.Score? = {
+  var best: score.Score? = none
+  for s in published.all() {
+    if s.benchmark == bm and s.variant == variant and reachable(s.model) then {
+      match best {
+        none => { best = some(s) },
+        some(b) => if s.value > b.value then { best = some(s) },
+      }
+    }
+  }
+  best
+}
+
+// Runnable here, and carrying no published figure on that benchmark. The intersection is
+// small and it is the whole point: these are the measurements that do not exist yet, so
+// they are the ones worth spending a night producing.
+fn unmeasured_but_runnable(bm: String, variant: String) -> List[String] = {
+  var out: List[String] = []
+  for d in WORKERS_AI {
+    match published.find(bm, variant, d.model) {
+      none => list.push(out, d.model),
+      some(_) => {},
+    }
+  }
+  out
+}
+
+test "the question 'is Kimi K3 required' is answered by the catalogue, not the leaderboard" {
+  // It leads the benchmark that is 30% of the agentic composite.
+  match published.find("terminal-bench", "2.0", "kimi-k3") {
+    some(s) => {
+      assert(score.near(s.value, 88.3, 0.01))
+      match published.find("terminal-bench", "2.0", "claude-mythos-5") {
+        some(c) => assert(s.value > c.value),
+        none => assert(false),
+      }
+    },
+    none => assert(false),
+  }
+  // And it cannot be called. Both halves have to be visible at once, or the plan is wrong
+  // in one direction or the other.
+  assert(not reachable("kimi-k3"))
+  match unreachable("kimi-k3") {
+    some(u) => assert(string.contains(u.note, "88.3")),
+    none => assert(false),
+  }
+}
+
+test "a reachable open-weight model already beats two listed Claude models, which answers the rest of it" {
+  match best_reachable("terminal-bench", "2.0") {
+    some(b) => {
+      // Not GLM-5.3: it has no row. The best number we can both call and cite is its
+      // predecessor's.
+      assert(b.model == "glm-5.2")
+      assert(score.near(b.value, 81.0, 0.01))
+      match published.find("terminal-bench", "2.0", "claude-sonnet-5") {
+        some(c) => { assert(score.comparable(b, c, "")); assert(b.value > c.value) },
+        none => assert(false),
+      }
+      match published.find("terminal-bench", "2.0", "claude-opus-4.8") {
+        some(c) => assert(b.value > c.value),
+        none => assert(false),
+      }
+      // The ceiling is equally real: it does not reach the top two Claude rows.
+      match published.find("terminal-bench", "2.0", "claude-fable-5") {
+        some(c) => assert(b.value < c.value),
+        none => assert(false),
+      }
+    },
+    none => assert(false),
+  }
+}
+
+test "GLM-5.3 is the runnable unmeasured case, which is why it is the one being measured" {
+  assert(reachable("glm-5.3"))
+  let gap = unmeasured_but_runnable("terminal-bench", "2.0")
+  assert(list.contains(gap, "glm-5.3"))
+  // Recorded as an absence too, so the missing row cannot be mistaken for a low one.
+  match published.absence("terminal-bench", "2.0", "glm-5.3") {
+    some(a) => assert(string.contains(a.note, "no published")),
+    none => assert(false),
+  }
+  // GLM-5.2 is the counter-case: runnable AND measured, so it is not in the gap list.
+  assert(reachable("glm-5.2"))
+  assert(not list.contains(gap, "glm-5.2"))
+}
