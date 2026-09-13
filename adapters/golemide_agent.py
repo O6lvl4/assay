@@ -501,6 +501,24 @@ class GolemideAgent(BaseAgent):
         if verify is None:
             verify = await self._derive_verify(environment, root)
             source = "derived from the task's files"
+            # The same discriminate test the stated tier gets, and it was missing here --
+            # applied only where the idea happened to be under consideration, which is how a
+            # principle becomes a special case.
+            #
+            # Measured: on circuit-fibsqrt the derived command was
+            # `cc -O1 -o /tmp/_assay_build sim.c && /tmp/_assay_build`, and it PASSES on the
+            # untouched task, because `sim.c` compiles and runs fine -- the task is about what
+            # the simulation computes, not whether it builds. golemide then correctly refused
+            # to work ("already passes -- nothing was changed") and the trial scored zero on a
+            # criterion that could never have guided anything.
+            if verify is not None:
+                probe = await environment.exec(verify, cwd=root, timeout_sec=180)
+                if probe.return_code == 0:
+                    self.logger.warning(
+                        "derived criteria already pass on the untouched task, so they cannot "
+                        "guide an edit; abstaining: %s", verify
+                    )
+                    verify = None
         if verify is None:
             # Last resort, and the only one that reads the instruction: state the criteria,
             # then keep them only if they fail on the untouched task.
@@ -558,12 +576,18 @@ class GolemideAgent(BaseAgent):
                 "--verify", str(script),
                 "--model", self.model_name or "cf:glm-5.3",
                 "--attempts", attempts,
+                # Looking around before editing. On a task that ships no tests this is the
+                # only way the agent learns anything beyond the file listing, and it is what
+                # the no-signal tier is otherwise missing.
+                "--explore", os.environ.get("GOLEMIDE_EXPLORE", "1"),
             ]
             # Write straight to the log file rather than buffering through a pipe. Harbor
-            # kills an agent at its own timeout (1800s), and `communicate()` holds everything
-            # in memory until the process exits -- so a timed-out run lost its entire log,
-            # including the cost line. A 30-minute run's spend became unreportable, which is
-            # the one kind of missing record that cannot be reconstructed afterwards.
+            # kills an agent at the timeout the TASK declares -- `[agent] timeout_sec` in its
+            # task.toml, which across terminal-bench-2 runs from 600s to 12000s, so there is no
+            # single deadline to design around -- and `communicate()` holds everything in memory
+            # until the process exits, so a killed run lost its entire log, including the cost
+            # line. That run's spend became unreportable, which is the one kind of missing
+            # record that cannot be reconstructed afterwards.
             log_path = self.logs_dir / "golemide.log"
             try:
                 with open(log_path, "wb") as sink:
