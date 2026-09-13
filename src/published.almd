@@ -73,6 +73,31 @@ let SWE_BENCH_PRO: List[score.Score] = [
     value: 53.4, n: 0, harness: AGENT_UNDISCLOSED, source: SWE_PRO_SRC },
 ]
 
+// --- Terminal-Bench 2.0: the composite's largest component, and a terminal agent's own
+// --- ground. 30% of the agentic weight, and the only component a coding/terminal harness
+// --- can actually compete on.
+//
+// An open-weight model already leads it. That is the finding this file exists to make
+// checkable: the qualitative observation that started this work was right, and only the
+// arithmetic that turned it into "13 points" was wrong.
+let TB_SRC = "https://benchlm.ai/benchmarks/terminal-bench"
+let TERMINAL_BENCH_20: List[score.Score] = [
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "kimi-k3",
+    value: 88.3, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "claude-mythos-5",
+    value: 88.0, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "claude-fable-5",
+    value: 84.3, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "glm-5.2",
+    value: 81.0, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "claude-sonnet-5",
+    value: 80.4, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "claude-opus-4.8",
+    value: 74.6, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+  score.Score { benchmark: "terminal-bench", variant: "2.0", model: "glm-5.1",
+    value: 63.5, n: 0, harness: AGENT_UNDISCLOSED, source: TB_SRC },
+]
+
 // --- the agentic composite, and the components each model is actually listed for ---
 //
 // This is the asymmetry that produced the founding mistake. The composite is published for
@@ -108,6 +133,13 @@ let ABSENCES: List[Absence] = [
   Absence { benchmark: "aider-polyglot", variant: "225", model: "claude-opus-5",
     note: "current Claude models are absent; the leaderboard's best Claude is opus-4 from 2025-05, so beating 72.0 is not beating current Claude",
     source: AIDER_SRC },
+  Absence { benchmark: "terminal-bench", variant: "2.0", model: "glm-5.3",
+    note: "no published Terminal-Bench 2.0 run, though GLM-5.2 is listed at 81.0. This is the runnable target: 30% of the agentic composite, a terminal agent's own ground, and no number exists",
+    source: TB_SRC },
+  // The finding that makes the composite undecomposable, rather than merely awkward.
+  Absence { benchmark: "terminal-bench", variant: "2.0", model: "claude-fable-5.1",
+    note: "the model that HOLDS the published agentic composite of 80.2 is listed on none of its own component leaderboards (Terminal-Bench 2.0, BrowseComp, OSWorld-Verified all list Fable 5 / Mythos 5 / Sonnet 5 instead). So 80.2 cannot be reproduced from any published component value, in either direction",
+    source: TB_SRC },
 ]
 
 // The published composites, kept separate from the components on purpose: these are the
@@ -126,7 +158,7 @@ let AGENTIC_COMPOSITE: List[score.Score] = [
 ]
 
 fn all() -> List[score.Score] =
-  AIDER_POLYGLOT + SWE_BENCH_PRO + AGENTIC_COMPONENTS + AGENTIC_COMPOSITE
+  AIDER_POLYGLOT + SWE_BENCH_PRO + TERMINAL_BENCH_20 + AGENTIC_COMPONENTS + AGENTIC_COMPOSITE
 
 fn find(bm: String, variant: String, model: String) -> score.Score? =
   list.find(all(), (s) => s.benchmark == bm and s.variant == variant and s.model == model)
@@ -182,9 +214,18 @@ test "the published composite is not the coverage, and the coverage refuses the 
   }
   let k = score.coverage("kimi-k3", defn, all())
   let f = score.coverage("claude-fable-5", defn, all())
-  // Neither is anywhere near complete, and they do not overlap.
-  assert(k.covered < 0.3)
-  assert(f.covered < 0.3)
+
+  // The sharpest form of the trap. Both cover exactly 55 of the 90 documented weight, so
+  // side by side they look equally complete -- and the 55 is not the same 55. Kimi K3 has
+  // Terminal-Bench and BrowseComp; Fable 5 has Terminal-Bench and OSWorld-Verified. A
+  // "coverage" column alone would have hidden this; only the found-set shows it.
+  assert(score.near(k.covered, f.covered, 0.001))
+  assert(score.near(k.covered, 55.0 / 90.0, 0.001))
+  assert(list.contains(k.found, "browsecomp/"))
+  assert(not list.contains(f.found, "browsecomp/"))
+  assert(list.contains(f.found, "osworld/verified"))
+  assert(not list.contains(k.found, "osworld/verified"))
+
   assert(string.contains(score.coverage_incomparable(k, f), "different components"))
   assert(result.is_err(score.composite_delta(k, f)))
 
@@ -192,6 +233,53 @@ test "the published composite is not the coverage, and the coverage refuses the 
   match (find("benchlm-agentic", "composite", "kimi-k3"), find("benchlm-agentic", "composite", "claude-fable-5.1")) {
     (some(a), some(b)) => assert(score.near(b.value - a.value, 8.3, 0.01)),
     _ => assert(false),
+  }
+}
+
+test "an open-weight model already leads every listed Claude on the composite's biggest component" {
+  let best_open = find("terminal-bench", "2.0", "kimi-k3")
+  let best_claude = find("terminal-bench", "2.0", "claude-mythos-5")
+  match (best_open, best_claude) {
+    (some(o), some(c)) => {
+      // Same leaderboard, same page, so this one IS a legitimate comparison.
+      assert(score.comparable(o, c, ""))
+      assert(o.value > c.value)
+      match score.delta(o, c, "") { ok(d) => assert(score.near(d, 0.3, 0.01)), err(_) => assert(false) }
+    },
+    _ => assert(false),
+  }
+  // And the same holds on the other two components, from the same aggregator's own pages.
+  match (find("browsecomp", "", "kimi-k3"), find("browsecomp", "", "claude-opus-5")) {
+    (some(o), some(c)) => assert(o.value > c.value),
+    _ => assert(false),
+  }
+  match (find("osworld", "verified", "qwen3.8-max"), find("osworld", "verified", "claude-fable-5")) {
+    (some(o), some(c)) => assert(o.value > c.value),
+    _ => assert(false),
+  }
+  // Yet the published composite puts Claude 8.3 points ahead. The opening observation of
+  // this whole line of work was therefore correct; only its quantification was invented.
+  match (find("benchlm-agentic", "composite", "claude-fable-5.1"), find("benchlm-agentic", "composite", "kimi-k3")) {
+    (some(c), some(o)) => assert(c.value > o.value),
+    _ => assert(false),
+  }
+}
+
+test "the composite cannot be decomposed, because its own holder is absent from its components" {
+  // Fable 5.1 holds the 80.2 composite and appears on no component leaderboard checked.
+  assert(option.is_none(find("terminal-bench", "2.0", "claude-fable-5.1")))
+  assert(option.is_none(find("browsecomp", "", "claude-fable-5.1")))
+  assert(option.is_none(find("osworld", "verified", "claude-fable-5.1")))
+  assert(option.is_some(find("benchlm-agentic", "composite", "claude-fable-5.1")))
+  match absence("terminal-bench", "2.0", "claude-fable-5.1") {
+    some(a) => assert(string.contains(a.note, "cannot be reproduced")),
+    none => assert(false),
+  }
+  // This is the real reason the composite is not a target -- stronger than "60% of it is
+  // GUI and web work", which was the first and weaker reason given.
+  match absence("terminal-bench", "2.0", "glm-5.3") {
+    some(a) => assert(string.contains(a.note, "runnable target")),
+    none => assert(false),
   }
 }
 
