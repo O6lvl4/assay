@@ -149,8 +149,8 @@ fn coverage_incomparable(a: Coverage, b: Coverage) -> String = {
   let only_b = list.filter(b.found, (f) => not list.contains(a.found, f))
   if list.is_empty(only_a) and list.is_empty(only_b) then ""
   else "these composites average over different components, so their difference describes nothing"
-    + (if list.is_empty(only_a) then "" else "; only " + a.model + " has " + string.join(only_a, ", "))
-    + (if list.is_empty(only_b) then "" else "; only " + b.model + " has " + string.join(only_b, ", "))
+    + (if list.is_empty(only_a) then "" else "; only " + a.model + " has " + list.join(only_a, ", "))
+    + (if list.is_empty(only_b) then "" else "; only " + b.model + " has " + list.join(only_b, ", "))
 }
 
 fn composite_delta(a: Coverage, b: Coverage) -> Result[Float, String] = {
